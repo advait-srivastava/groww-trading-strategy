@@ -13,17 +13,52 @@ VOL_LOOKBACK_DAYS = 20
 LIQUIDITY_LOOKBACK_DAYS = 20
 MIN_AVG_DAILY_TURNOVER = 5_00_00_000  # Rs 5 crore/day, keeps slippage low
 
+# Forward-fill limit for the signal/trading panels. Long enough to bridge NSE
+# holidays and the odd missing print, short enough that a suspended or delisted
+# name goes NaN instead of being carried at a frozen price forever. An
+# unlimited ffill (the previous behaviour) silently defeated the has_history
+# check below, because it removed the very NaNs that check looks for.
+STALE_PRICE_LIMIT_DAYS = 5
 
-def build_close_panel(history: dict[str, pd.DataFrame]) -> pd.DataFrame:
-    """Wide close-price panel (dates x symbols), forward-filled for holidays/listings gaps."""
+
+def build_close_panel(
+    history: dict[str, pd.DataFrame], ffill_limit: int | None = STALE_PRICE_LIMIT_DAYS
+) -> pd.DataFrame:
+    """Wide close-price panel (dates x symbols) for signals and trading.
+
+    NaN means "no recent price" -- not tradeable and not selectable. Pass
+    ffill_limit=None only when you explicitly want stale prices carried
+    forward (see build_mark_panel).
+    """
     closes = {sym: df["close"] for sym, df in history.items()}
     panel = pd.DataFrame(closes).sort_index()
-    return panel.ffill()
+    return panel.ffill(limit=ffill_limit)
 
 
-def build_turnover_panel(history: dict[str, pd.DataFrame]) -> pd.DataFrame:
+def build_mark_panel(history: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    """Fully forward-filled close panel, used *only* to value existing holdings.
+
+    Kept separate from the signal panel so that a data gap in a held name marks
+    it at its last known price rather than at zero, while still being excluded
+    from new selection by build_close_panel's limited ffill.
+    """
+    return build_close_panel(history, ffill_limit=None)
+
+
+def build_open_panel(
+    history: dict[str, pd.DataFrame], ffill_limit: int | None = STALE_PRICE_LIMIT_DAYS
+) -> pd.DataFrame:
+    """Wide open-price panel, used to execute on the bar *after* a signal."""
+    opens = {sym: df["open"] for sym, df in history.items()}
+    panel = pd.DataFrame(opens).sort_index()
+    return panel.ffill(limit=ffill_limit)
+
+
+def build_turnover_panel(
+    history: dict[str, pd.DataFrame], ffill_limit: int | None = STALE_PRICE_LIMIT_DAYS
+) -> pd.DataFrame:
     turnover = {sym: df["close"] * df["volume"] for sym, df in history.items()}
-    return pd.DataFrame(turnover).sort_index().ffill()
+    return pd.DataFrame(turnover).sort_index().ffill(limit=ffill_limit)
 
 
 def eligible_mask(price_panel: pd.DataFrame, turnover_panel: pd.DataFrame, as_of) -> pd.Series:
@@ -88,9 +123,18 @@ def select_portfolio(
     as_of,
     top_n: int = 18,
     max_weight: float = 0.12,
+    allowed: list[str] | None = None,
 ) -> pd.Series:
-    """Full pipeline: filter -> rank by momentum -> pick top N -> inverse-vol weight."""
+    """Full pipeline: filter -> rank by momentum -> pick top N -> inverse-vol weight.
+
+    `allowed` restricts selection to index members as of `as_of` (point-in-time
+    universe). None means "any symbol in the panel", which is survivorship-
+    biased in a backtest -- see strategy/universe.py.
+    """
     eligible = eligible_mask(price_panel, turnover_panel, as_of)
+    if allowed is not None:
+        in_universe = price_panel.columns.isin(set(allowed))
+        eligible = eligible & pd.Series(in_universe, index=price_panel.columns)
     eligible_symbols = eligible[eligible].index
 
     if len(eligible_symbols) == 0:

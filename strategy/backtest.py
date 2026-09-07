@@ -19,7 +19,8 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 
-from strategy import factors, macro, regime
+from strategy import data as data_quality
+from strategy import factors, macro, regime, universe
 from strategy.data import fetch_history, fetch_universe_history
 from strategy.universe import get_universe
 
@@ -49,29 +50,115 @@ def run_backtest(
     use_macro_regime: bool = False,
     use_internal_regime: bool = True,
     index_close: pd.Series | None = None,
+    exec_panel: pd.DataFrame | None = None,
+    mark_panel: pd.DataFrame | None = None,
+    universe_at=None,
 ) -> dict:
+    """Simulate the strategy.
+
+    Execution model: a rebalance decided from day N's close is executed on day
+    N+1, one full session later. Deciding and transacting on the same close
+    would guarantee filling at exactly the price the signal was derived from,
+    which is a lookahead the live script cannot reproduce.
+
+    `exec_panel` supplies the fill prices for that next session -- defaults to
+    `price_panel` (next close). Passing an open panel gives next-open fills,
+    but only do that once the open data is verified real; see
+    data.open_price_quality(). `mark_panel` (fully forward-filled) values
+    existing holdings so a data gap doesn't mark a position to zero. Held names
+    that go stale in `price_panel` are force-exited at their last known mark
+    rather than carried indefinitely.
+
+    `universe_at(day) -> list[str]` supplies point-in-time index membership.
+    """
     dates = price_panel.index
     rdates = rebalance_dates(dates, backtest_start)
     if not rdates:
         raise ValueError("No rebalance dates in range -- check backtest_start vs data history")
+
+    exec_panel = exec_panel if exec_panel is not None else price_panel
+    marks = mark_panel if mark_panel is not None else price_panel
 
     shares = pd.Series(0.0, index=price_panel.columns)
     cash = initial_capital
     equity_curve = []
     turnover_log = []
     holdings_log = []
+    stale_exits = []
 
     daily_index = dates[(dates >= rdates[0]) & (dates <= dates.max())]
     rdate_set = set(rdates)
+    pending = None  # signal awaiting execution at the next bar's open
 
     for day in daily_index:
-        prices_today = price_panel.loc[day]
+        marks_today = marks.loc[day]
 
+        # 1. Force-exit holdings with no recent tradeable price (suspension /
+        #    delisting), at the last known mark.
+        held = shares[shares > 0].index
+        if len(held):
+            stale = held[price_panel.loc[day, held].isna()]
+            if len(stale):
+                proceeds = float((shares[stale] * marks_today[stale].fillna(0)).sum())
+                cash += proceeds
+                shares[stale] = 0.0
+                stale_exits.append({
+                    "date": day,
+                    "symbols": ",".join(stale),
+                    "n_symbols": len(stale),
+                    "proceeds": proceeds,
+                })
+
+        # 2. Execute the previous session's decision at today's open.
+        if pending is not None:
+            weights, effective_buffer, flags = pending
+            pending = None
+
+            exec_prices = exec_panel.loc[day].replace(0, np.nan)
+            untradeable = exec_prices.isna()
+            # Value everything at execution prices where they exist, last mark
+            # otherwise, so the cash identity below conserves value exactly.
+            valuation = exec_prices.fillna(marks_today).fillna(0)
+
+            portfolio_value = cash + float((shares * valuation).sum())
+            investable = portfolio_value * (1 - effective_buffer)
+
+            target_value = pd.Series(0.0, index=price_panel.columns)
+            if not weights.empty:
+                target_value.loc[weights.index] = investable * weights
+
+            new_shares = (target_value / exec_prices).fillna(0.0)
+            new_shares[untradeable] = shares[untradeable]  # can't trade, hold as-is
+
+            traded = ~untradeable
+            gross_turnover = float(
+                ((new_shares[traded] - shares[traded]) * valuation[traded]).abs().sum()
+            )
+            cost = gross_turnover * (cost_bps / 10_000.0)
+            cash = portfolio_value - float((new_shares * valuation).sum()) - cost
+
+            shares = new_shares
+            turnover_log.append({"date": day, "gross_turnover": gross_turnover, "cost": cost})
+            holdings_log.append({
+                "date": day,
+                "signal_date": flags["signal_date"],
+                "n_positions": int((shares > 0).sum()),
+                "n_untradeable": int((untradeable & (target_value > 0)).sum()),
+                "cash_buffer": effective_buffer,
+                "risk_off": flags["risk_off"],
+                "macro_risk_off": flags["macro_risk_off"],
+                "internal_risk_off": flags["internal_risk_off"],
+            })
+
+        # 3. Generate a signal from today's close, for execution next session.
         if day in rdate_set:
-            portfolio_value = cash + (shares * prices_today.fillna(0)).sum()
-
             weights = factors.select_portfolio(
-                price_panel, turnover_panel, day, top_n=top_n, max_weight=max_weight
+                price_panel,
+                turnover_panel,
+                day,
+                top_n=top_n,
+                max_weight=max_weight,
+                allowed=universe_at(day) if universe_at is not None else None,
             )
 
             macro_risk_off = False
@@ -84,46 +171,34 @@ def run_backtest(
 
             risk_off = macro_risk_off or internal_risk_off
             effective_buffer = macro.RISK_OFF_CASH_BUFFER if risk_off else cash_buffer
-            investable = portfolio_value * (1 - effective_buffer)
+            pending = (
+                weights,
+                effective_buffer,
+                {
+                    "signal_date": day,
+                    "risk_off": risk_off,
+                    "macro_risk_off": macro_risk_off,
+                    "internal_risk_off": internal_risk_off,
+                },
+            )
 
-            target_value = pd.Series(0.0, index=price_panel.columns)
-            if not weights.empty:
-                target_value.loc[weights.index] = investable * weights
-
-            current_value = shares * prices_today.fillna(0)
-            trade_value = target_value - current_value
-            gross_turnover = trade_value.abs().sum()
-
-            valid_price = prices_today.replace(0, np.nan)
-            new_shares = (target_value / valid_price).fillna(0)
-            new_shares[valid_price.isna()] = shares[valid_price.isna()]  # can't trade, hold as-is
-
-            cost = gross_turnover * (cost_bps / 10_000.0)
-            cash = portfolio_value - (new_shares * prices_today.fillna(0)).sum() - cost
-
-            shares = new_shares
-            turnover_log.append({"date": day, "gross_turnover": gross_turnover, "cost": cost})
-            holdings_log.append({
-                "date": day,
-                "n_positions": (shares > 0).sum(),
-                "cash_buffer": effective_buffer,
-                "risk_off": risk_off,
-                "macro_risk_off": macro_risk_off,
-                "internal_risk_off": internal_risk_off,
-            })
-
-        mtm = cash + (shares * prices_today.fillna(0)).sum()
+        mtm = cash + float((shares * marks_today.fillna(0)).sum())
         equity_curve.append({"date": day, "equity": mtm})
+
+    unexecuted = pending[2]["signal_date"] if pending is not None else None
 
     equity_df = pd.DataFrame(equity_curve).set_index("date")["equity"]
     turnover_df = pd.DataFrame(turnover_log).set_index("date") if turnover_log else pd.DataFrame()
     holdings_df = pd.DataFrame(holdings_log).set_index("date") if holdings_log else pd.DataFrame()
+    stale_df = pd.DataFrame(stale_exits).set_index("date") if stale_exits else pd.DataFrame()
 
     return {
         "equity_curve": equity_df,
         "turnover": turnover_df,
         "holdings": holdings_df,
+        "stale_exits": stale_df,
         "rebalance_dates": rdates,
+        "unexecuted_signal": unexecuted,
     }
 
 
@@ -195,6 +270,23 @@ def main():
         "On by default: validated to improve Sharpe 0.90->0.94 and cut max drawdown "
         "-24.85%%->-20.97%%.",
     )
+    parser.add_argument(
+        "--exec-price",
+        choices=["next_close", "next_open"],
+        default="next_close",
+        help="Fill price for the session after a signal. Default next_close: the cached "
+        "open column is synthetic (open == previous close) for 2025+, so next_open "
+        "would silently collapse into same-bar execution. next_open is validated at "
+        "runtime and falls back if the data is untrustworthy.",
+    )
+    parser.add_argument(
+        "--point-in-time",
+        action="store_true",
+        help="Restrict each rebalance to the Nifty 200 members as of that date, using the "
+        "dated snapshot archive in strategy/data_cache/universe/. Off by default only "
+        "because the archive does not yet span the backtest window -- see "
+        "strategy/universe.py for why NSE makes this hard.",
+    )
     parser.add_argument("--out", default="strategy/data_cache/equity_curve.csv")
     args = parser.parse_args()
 
@@ -202,15 +294,52 @@ def main():
     backtest_start = pd.Timestamp(args.backtest_start)
     end = datetime.strptime(args.end, "%Y-%m-%d")
 
-    symbols = get_universe()
+    # Price history is loaded for the union of every constituent snapshot; the
+    # backtest then restricts each rebalance to point-in-time membership.
+    symbols = universe.universe_union() if args.point_in_time else get_universe()
     print(f"Loading cached history for {len(symbols)} symbols...")
     history = fetch_universe_history(symbols, data_start, end)
     print(f"Loaded {len(history)}/{len(symbols)} symbols with data.")
 
+    coverage = universe.coverage(backtest_start)
+    print(f"Universe mode: {'point-in-time' if args.point_in_time else 'current-constituents'}"
+          f"  (coverage: {coverage})")
+    warning = universe.bias_warning(backtest_start)
+    if warning:
+        print(f"\n!! {warning}\n")
+
     nifty = fetch_history("NIFTY", data_start, end)
 
     price_panel = factors.build_close_panel(history)
+    mark_panel = factors.build_mark_panel(history)
     turnover_panel = factors.build_turnover_panel(history)
+
+    exec_panel = None  # None -> fill at the next session's close
+    if args.exec_price == "next_open":
+        quality = data_quality.open_price_quality(history)
+        suspect = data_quality.suspect_open_years(quality)
+        print(
+            f"Open-price check: {quality['synthetic_share']*100:.1f}% of "
+            f"{quality['rows']:,} rows have open == previous close"
+        )
+        if suspect:
+            detail = ", ".join(f"{y} {share*100:.1f}% of {n:,}" for y, n, share in suspect)
+            print(
+                f"!! Refusing --exec-price next_open: open == previous close in {detail}. "
+                "Those opens are synthetic, so next-open fills would collapse back into "
+                "same-bar execution. Falling back to next_close."
+            )
+        else:
+            exec_panel = factors.build_open_panel(history)
+
+    universe_at = None
+    if args.point_in_time:
+        cache: dict[pd.Timestamp, list[str]] = {}
+
+        def universe_at(day):  # noqa: F811 -- deliberate conditional definition
+            if day not in cache:
+                cache[day] = get_universe(as_of=day)
+            return cache[day]
 
     result = run_backtest(
         price_panel,
@@ -224,6 +353,9 @@ def main():
         use_macro_regime=args.macro_regime,
         use_internal_regime=not args.no_internal_regime,
         index_close=nifty["close"],
+        exec_panel=exec_panel,
+        mark_panel=mark_panel,
+        universe_at=universe_at,
     )
 
     strat_stats = performance_stats(result["equity_curve"], "Momentum + Trend Strategy")
@@ -238,9 +370,20 @@ def main():
     avg_positions = result["holdings"]["n_positions"].mean() if not result["holdings"].empty else 0
     print(f"\n--- Trading activity ---")
     print(f"  Rebalances:          {len(result['rebalance_dates'])}")
+    effective_exec = "next close" if exec_panel is None else "next open"
+    print(f"  Executed:            {len(result['turnover'])} "
+          f"(signal at close, filled next session @ {effective_exec})")
     print(f"  Avg positions held:  {avg_positions:.1f}")
     print(f"  Avg turnover/rebal:  Rs {avg_turnover:,.0f}")
     print(f"  Total cost drag:     Rs {total_cost:,.0f}")
+    if result["unexecuted_signal"] is not None:
+        print(f"  Unexecuted signal:   {result['unexecuted_signal'].date()} (no next session in data)")
+    stale = result["stale_exits"]
+    if not stale.empty:
+        print(f"  Stale-price exits:   {int(stale['n_symbols'].sum())} position(s) "
+              f"on {len(stale)} day(s), Rs {stale['proceeds'].sum():,.0f} recovered")
+    if not result["holdings"].empty and result["holdings"]["n_untradeable"].sum():
+        print(f"  Skipped (no open):   {int(result['holdings']['n_untradeable'].sum())} target position(s)")
     if not result["holdings"].empty and (args.macro_regime or not args.no_internal_regime):
         h = result["holdings"]
         print(f"  Risk-off rebalances: {int(h['risk_off'].sum())}/{len(result['rebalance_dates'])} (combined)")
