@@ -1,4 +1,8 @@
 .env
 .venv/
 __pycache__/
-strategy/data_cache/
+# Cached candles are large and re-fetchable; the dated constituent snapshots
+# are neither -- NSE publishes no historical archive, so once a snapshot is
+# lost it cannot be rebuilt. Track those.
+strategy/data_cache/*
+!strategy/data_cache/universe/

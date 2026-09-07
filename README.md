@@ -14,15 +14,35 @@ dry-run-first execution model.
 **Equity: momentum + trend rotation** (`strategy/backtest.py`, `strategy/rebalance.py`)
 Monthly-rebalanced, long-only strategy over the Nifty 200: rank stocks trading
 above their 200-day average by 12-month momentum, size the top 18 by inverse
-volatility, with a validated market-breadth/volatility overlay that raises
-the cash buffer when conditions turn risk-off.
+volatility, with a market-breadth/volatility overlay that raises the cash
+buffer when conditions turn risk-off.
 
-Backtested 2022–2026 against real Groww historical data:
+Backtested 2022-01-03 to 2026-08-28 against real Groww historical data.
+Signals are taken from each rebalance date's close and filled one session
+later, so no result depends on trading at a price the signal was derived from.
 
-| | CAGR | Sharpe | Max Drawdown |
-|---|---|---|---|
-| Strategy | 24.92% | 0.94 | -20.97% |
-| NIFTY 50 buy & hold | 6.93% | 0.03 | -16.47% |
+| | CAGR | Sharpe | Max Drawdown | Calmar |
+|---|---|---|---|---|
+| Strategy (breadth/vol overlay, default) | 24.18% | 0.88 | -21.05% | 1.15 |
+| Strategy (no overlay) | 25.49% | 0.89 | -25.27% | 1.01 |
+| NIFTY 50 buy & hold | 7.03% | 0.04 | -16.47% | 0.43 |
+
+The overlay's case is drawdown, not risk-adjusted return: it costs 1.3 points
+of CAGR and leaves Sharpe flat (0.89 -> 0.88), but cuts max drawdown by 4.2
+points and lifts Calmar from 1.01 to 1.15. The Alpha Vantage macro overlay
+(`--macro-regime`) stays off by default -- it backtests worse than doing
+nothing (Sharpe 0.82, max drawdown -26.05% used alone).
+
+**These figures are survivorship-biased and read high.** NSE publishes only
+the *current* Nifty 200 list and no dated archive, so history is tested
+against today's constituents: names dropped from the index are absent, and
+names added are present partly because they rose. `strategy/universe.py` keeps
+a dated snapshot archive, and `--point-in-time` restricts each rebalance to
+the membership known as of that date; every run prints whether its universe is
+point-in-time or biased. Against a synthetic earlier snapshot, restricting
+membership moved CAGR to 16.72% and Sharpe to 0.53 -- index composition
+matters more here than any other modelling choice. The archive only covers
+dates recorded from 2026-08-30 onward.
 
 **Options: weekly NIFTY bull put credit spread** (`strategy/options_backtest.py`, `strategy/options_rebalance.py`)
 Sells a defined-risk put spread each week when the same regime signal reads

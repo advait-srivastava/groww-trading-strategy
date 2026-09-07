@@ -97,11 +97,78 @@ def fetch_history(
     return full.loc[start:end]
 
 
+def open_price_quality(history: dict[str, pd.DataFrame]) -> dict:
+    """Measure how trustworthy the `open` column is, by year.
+
+    Groww's cached daily candles return open == previous close for most rows
+    from 2025 onward (98.9% in this dataset) and omit open entirely on some
+    days. A synthetic open makes "execute at the next open" collapse into
+    "execute at the signal bar's close" -- reintroducing the exact same-bar
+    lookahead that next-bar execution is meant to remove. Callers that want to
+    fill at the open must check this first.
+
+    Returned `by_year` maps year -> {"n", "synthetic_share"}. Judge per year,
+    not on the overall average: the corruption here is concentrated in 2025+,
+    and a single bad year invalidates a backtest that spans it.
+    """
+    frames = []
+    for df in history.values():
+        df = df.sort_index()
+        frames.append(pd.DataFrame({"open": df["open"], "prev_close": df["close"].shift(1)}))
+    empty = {"rows": 0, "synthetic_share": float("nan"), "by_year": {}}
+    if not frames:
+        return empty
+
+    combined = pd.concat(frames)
+    combined = combined[combined["open"].notna() & combined["prev_close"].notna()]
+    if combined.empty:
+        return empty
+
+    synthetic = combined["open"] == combined["prev_close"]
+    grouped = synthetic.groupby(combined.index.year)
+    return {
+        "rows": len(combined),
+        "synthetic_share": float(synthetic.mean()),
+        "by_year": {
+            int(year): {"n": int(g.size), "synthetic_share": float(g.mean())}
+            for year, g in grouped
+        },
+    }
+
+
+def suspect_open_years(
+    quality: dict, max_synthetic_share: float = 0.25, min_rows: int = 200
+) -> list[tuple[int, int, float]]:
+    """Years whose `open` column looks synthetic, as (year, n, synthetic_share)."""
+    return [
+        (year, stats["n"], stats["synthetic_share"])
+        for year, stats in sorted(quality.get("by_year", {}).items())
+        if stats["n"] >= min_rows and stats["synthetic_share"] > max_synthetic_share
+    ]
+
+
+class _LazyClient:
+    """Authenticates on first actual use, so a fully-cached run needs no credentials.
+
+    fetch_history() only touches the client when it has to hit the API, so
+    passing this through lets an offline backtest run entirely off data_cache/
+    without valid Groww API keys.
+    """
+
+    def __init__(self):
+        self._client = None
+
+    def __getattr__(self, name):
+        if self._client is None:
+            self._client = get_client()
+        return getattr(self._client, name)
+
+
 def fetch_universe_history(
     symbols: list[str], start: datetime, end: datetime, use_cache: bool = True
 ) -> dict[str, pd.DataFrame]:
     """Fetch history for many symbols, reusing one authenticated client."""
-    groww = get_client()
+    groww = _LazyClient()
     out = {}
     for i, sym in enumerate(symbols, 1):
         try:
