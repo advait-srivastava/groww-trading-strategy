@@ -260,15 +260,16 @@ def main():
         "--macro-regime",
         action="store_true",
         help="Enable the Alpha Vantage macro overlay (USD/INR + US 10Y yield). "
-        "Off by default: backtested worse than doing nothing (CAGR 23.29%% vs 25.65%%, "
-        "Sharpe 0.82 vs 0.90) -- see strategy/regime.py vs strategy/macro.py comparison.",
+        "Off by default: backtested worse than doing nothing (used alone, CAGR 23.39%% vs "
+        "25.49%%, Sharpe 0.82 vs 0.89) -- see strategy/regime.py vs strategy/macro.py.",
     )
     parser.add_argument(
         "--no-internal-regime",
         action="store_true",
         help="Disable the internal breadth + volatility regime overlay (Groww data only). "
-        "On by default: validated to improve Sharpe 0.90->0.94 and cut max drawdown "
-        "-24.85%%->-20.97%%.",
+        "On by default, but for drawdown rather than Sharpe: it costs 1.3 points of CAGR "
+        "(25.49%%->24.18%%) and leaves Sharpe flat (0.89->0.88) while cutting max drawdown "
+        "-25.27%%->-21.05%% and lifting Calmar 1.01->1.15.",
     )
     parser.add_argument(
         "--exec-price",

@@ -39,10 +39,12 @@ def resolve_cash_buffer(
 ) -> tuple[float, dict | None]:
     """Cash buffer to use, elevated when either regime overlay reads risk-off.
 
-    Internal (breadth + volatility, Groww data) is on by default -- backtested
-    to improve Sharpe 0.90->0.94 and cut max drawdown -24.85%->-20.97%. Macro
-    (Alpha Vantage USD/INR + US 10Y yield) is off by default -- backtested
-    worse than doing nothing (see strategy/backtest.py comparison). Falls back
+    Internal (breadth + volatility, Groww data) is on by default, for drawdown
+    rather than Sharpe: it costs 1.3 points of CAGR (25.49%->24.18%) and leaves
+    Sharpe flat (0.89->0.88) while cutting max drawdown -25.27%->-21.05% and
+    lifting Calmar 1.01->1.15. Macro (Alpha Vantage USD/INR + US 10Y yield) is
+    off by default -- backtested worse than doing nothing, Sharpe 0.82 when
+    used alone (see strategy/backtest.py comparison). Falls back
     to the fixed cash_buffer (with a warning) if a signal can't be read, so a
     stale/unreachable data source never blocks a live rebalance.
     """
